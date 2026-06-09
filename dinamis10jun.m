@@ -281,9 +281,15 @@ pid_integral  = 0.0;
 pid_prev_err  = 0.0;
 pid_filt_rate = 0.0;
 
-% Logging — 23 kolom (sama dengan original)
-LOG = zeros(N_max, 23);
-LOG_replan = false(N_max, 1);
+% Logging — 31 kolom
+% Col 1-23 : sama dengan original
+% Col 24-25: F_att [x y]   gaya atraktif SAPF
+% Col 26-27: F_rep [x y]   gaya repulsif SAPF (total dari semua obs dinamis)
+% Col 28-29: F_tot [x y]   gaya resultan SAPF
+% Col 30   : sapf_active   flag (1 jika minimal 1 obs dinamis dalam R_infl)
+% Col 31   : p_goal_local [x y] disimpan terpisah di bawah
+LOG = zeros(N_max, 31);
+LOG_replan  = false(N_max, 1);
 obs_dyn_log = zeros(N_max, 4);
 camera_log  = zeros(N_max, 6);  % [seen1, d1, b1, seen2, d2, b2]
 k_end = N_max;
@@ -292,6 +298,12 @@ occ_init         = occ;
 path_smooth_init = path_smooth_m;
 path_smooth_replan = [];
 did_replan = false;
+
+% Buffer gaya SAPF untuk visualisasi animasi
+F_att_log  = zeros(N_max, 2);  % gaya atraktif [Fx Fy]
+F_rep_log  = zeros(N_max, 2);  % gaya repulsif total [Fx Fy]
+F_tot_log  = zeros(N_max, 2);  % gaya resultan [Fx Fy]
+pgoal_log  = zeros(N_max, 2);  % local lookahead point pada path
 
 %% ===================================================================
 %% 5. MAIN SIMULATION LOOP
@@ -453,6 +465,12 @@ for k = 1:N_max
     psi_des    = psi_ilos;
     u_cmd_base = u_des;
 
+    % Gaya SAPF: dihitung eksplisit untuk logging & visualisasi
+    vec_g   = p_goal_local - pos;
+    d_g     = norm(vec_g) + 1e-9;
+    F_att_k = sapf.zeta * (vec_g / d_g);   % gaya atraktif
+    F_rep_k = [0 0];                        % akumulasi gaya repulsif
+
     % Obstacle dinamis 1
     if seen1
         obs_for_sapf        = struct();
@@ -460,8 +478,9 @@ for k = 1:N_max
         obs_for_sapf.rad    = obs_dyn1.rad;
         obs_for_sapf.active = true;
 
-        [psi_sapf1, v_sapf1] = sapf_local_planner(pos, psi, p_goal_local, ...
+        [psi_sapf1, v_sapf1, F_rep1] = sapf_local_planner(pos, psi, p_goal_local, ...
             obs_for_sapf, u_cmd_base, sapf);
+        F_rep_k = F_rep_k + F_rep1;
 
         d_obs1 = meas1.dist - obs_dyn1.rad;
         if d_obs1 < sapf.R_infl
@@ -479,8 +498,9 @@ for k = 1:N_max
         obs_for_sapf.rad    = obs_dyn2.rad;
         obs_for_sapf.active = true;
 
-        [psi_sapf2, v_sapf2] = sapf_local_planner(pos, psi, p_goal_local, ...
+        [psi_sapf2, v_sapf2, F_rep2] = sapf_local_planner(pos, psi, p_goal_local, ...
             obs_for_sapf, u_cmd_base, sapf);
+        F_rep_k = F_rep_k + F_rep2;
 
         d_obs2 = meas2.dist - obs_dyn2.rad;
         if d_obs2 < sapf.R_infl
@@ -490,6 +510,8 @@ for k = 1:N_max
             u_cmd_base = min(u_cmd_base, v_sapf2);
         end
     end
+
+    % Heading SAPF & titik lookahead sudah dicatat di LOG di bawah
 
     %% ================================================================
     %% PID HEADING
@@ -597,12 +619,32 @@ for k = 1:N_max
     end
 
     %% ---- Logging ----
+    % Col  1    : t
+    % Col  2- 3 : x_m, y_m
+    % Col  4- 5 : psi, phi
+    % Col  6- 8 : u, v, r  [m/s, m/s, rad/s]
+    % Col  9-10 : cte_val, psi_des
+    % Col 11-12 : Fx, Fy
+    % Col 13-14 : u_cmd, r_cmd
+    % Col 15    : phi_des
+    % Col 16-17 : x_ref, y_ref
+    % Col 18-19 : d1, d2  (jarak ke obs dinamis)
+    % Col 20-21 : seen1, seen2
+    % Col 22-23 : psi_ilos, u_cmd_base
+    % Col 24-25 : F_att_k [x y]
+    % Col 26-27 : F_rep_k [x y]
+    % Col 28-29 : F_tot   [x y]
+    % Col 30-31 : p_goal_local [x y]
     LOG(k,:) = [t, x_m, y_m, psi, phi, ...
                 nu(1)*cell_m, nu(2)*cell_m, nu(3), ...
                 cte_val, psi_des, Fx, Fy, u_cmd, r_cmd, ...
                 phi_des, x_ref, y_ref, ...
                 d1, d2, ...
-                seen1, seen2, psi_ilos, u_cmd_base];
+                seen1, seen2, psi_ilos, u_cmd_base, ...
+                F_att_k(1), F_att_k(2), ...
+                F_rep_k(1), F_rep_k(2), ...
+                F_att_k(1)+F_rep_k(1), F_att_k(2)+F_rep_k(2), ...
+                p_goal_local(1), p_goal_local(2)];
 
     if mod(k, 500) == 0
         fprintf('t=%5.1f s | (%.1f, %.1f) m | u=%.2f m/s | ψ=%5.1f° | d_goal=%.1f m\n', ...
@@ -617,6 +659,16 @@ LOG        = LOG(1:k_end, :);
 LOG_replan = LOG_replan(1:k_end);
 obs_dyn_log = obs_dyn_log(1:k_end,:);
 camera_log  = camera_log(1:k_end,:);
+F_att_log  = F_att_log(1:k_end,:);
+F_rep_log  = F_rep_log(1:k_end,:);
+F_tot_log  = F_tot_log(1:k_end,:);
+pgoal_log  = pgoal_log(1:k_end,:);
+
+% Isi dari kolom LOG (sudah tersimpan di sana)
+F_att_log(:,1) = LOG(:,24);  F_att_log(:,2) = LOG(:,25);
+F_rep_log(:,1) = LOG(:,26);  F_rep_log(:,2) = LOG(:,27);
+F_tot_log(:,1) = LOG(:,28);  F_tot_log(:,2) = LOG(:,29);
+pgoal_log(:,1) = LOG(:,30);  pgoal_log(:,2) = LOG(:,31);
 
 t_log    = LOG(:,1);
 x_log    = LOG(:,2);  y_log    = LOG(:,3);
@@ -731,6 +783,31 @@ h_det2 = plot(NaN, NaN, 'bo','MarkerSize',12,'LineWidth',2,'HandleVisibility','o
 hInfoBox = text(1, -1.5, '','FontSize',11,'FontWeight','bold', ...
     'BackgroundColor','w','EdgeColor','k','LineWidth',1.2,'VerticalAlignment','top');
 
+%% ==== SETUP GAYA REPULSIF RADIAL DARI OBSTACLE ====
+% Panah-panah kecil memancar radial keluar dari tiap obstacle dinamis.
+% Panjang panah proporsional dengan magnitude gaya repulsif SAPF.
+% Hanya muncul saat kapal dalam R_infl (terdeteksi kamera).
+
+n_rep_arrows = 12;
+rep_angles   = linspace(0, 2*pi*(1 - 1/n_rep_arrows), n_rep_arrows);
+th_ri        = linspace(0, 2*pi, 60);
+
+% Quiver handle untuk repulsif obstacle 1 (merah) dan obstacle 2 (biru)
+h_rep1 = quiver(zeros(1,n_rep_arrows), zeros(1,n_rep_arrows), ...
+                zeros(1,n_rep_arrows), zeros(1,n_rep_arrows), 0, ...
+                'Color',[1.0 0.25 0.25],'LineWidth',1.8,'MaxHeadSize',0.6, ...
+                'DisplayName','F_{rep} Obs1','Visible','off');
+h_rep2 = quiver(zeros(1,n_rep_arrows), zeros(1,n_rep_arrows), ...
+                zeros(1,n_rep_arrows), zeros(1,n_rep_arrows), 0, ...
+                'Color',[0.25 0.45 1.0],'LineWidth',1.8,'MaxHeadSize',0.6, ...
+                'DisplayName','F_{rep} Obs2','Visible','off');
+
+% Lingkaran zona pengaruh SAPF (R_infl) — muncul bersamaan dengan panah
+h_rinfl1 = plot(NaN, NaN, '--','Color',[1.0 0.6 0.6],'LineWidth',0.9, ...
+    'HandleVisibility','off');
+h_rinfl2 = plot(NaN, NaN, '--','Color',[0.6 0.7 1.0],'LineWidth',0.9, ...
+    'HandleVisibility','off');
+
 tic;
 for k = 1:frame_step:length(t_log)
     set(tKapal, 'Matrix', makehgtform('translate',[x_log(k) y_log(k) 0],'zrotate',psi_log(k)));
@@ -742,7 +819,7 @@ for k = 1:frame_step:length(t_log)
     fov_y = [y_log(k), y_log(k) + fov_range*sin(fov_angles), y_log(k)];
     set(h_fov, 'XData', fov_x, 'YData', fov_y);
 
-    % Obstacle dinamis
+    % Posisi obstacle dinamis
     x1 = obs_dyn_log(k,1); y1 = obs_dyn_log(k,2);
     x2 = obs_dyn_log(k,3); y2 = obs_dyn_log(k,4);
     set(h_dyn1, 'Position', [x1-obs_size/2, y1-obs_size/2, obs_size, obs_size]);
@@ -752,6 +829,66 @@ for k = 1:frame_step:length(t_log)
     else;            set(h_det1,'Visible','off'); end
     if seen2_log(k), set(h_det2,'XData',x2,'YData',y2,'Visible','on');
     else;            set(h_det2,'Visible','off'); end
+
+    %% -- ANIMASI GAYA REPULSIF RADIAL --
+    % Panah memancar dari permukaan obstacle ke luar.
+    % Panjang panah = f(jarak kapal ke obstacle): makin dekat → makin panjang.
+
+    % Obstacle 1
+    if seen1_log(k)
+        d_o1    = norm([x_log(k)-x1, y_log(k)-y1]);
+        d_s1    = max(d_o1 - obs_dyn1.rad, 1e-3);
+
+        if d_s1 < sapf.R_infl
+            % Magnitude gaya repulsif SAPF di posisi kapal
+            mag1     = sapf.eta * (1/d_s1 - 1/sapf.R_infl) / (d_s1^2);
+            mag1     = max(0, mag1);
+            arr_len1 = min(mag1 * 0.8, sapf.R_infl * 0.55);
+
+            % Panah berasal dari permukaan obstacle
+            ox1 = x1 + obs_dyn1.rad * cos(rep_angles);
+            oy1 = y1 + obs_dyn1.rad * sin(rep_angles);
+
+            set(h_rep1, 'XData', ox1, 'YData', oy1, ...
+                        'UData', arr_len1 * cos(rep_angles), ...
+                        'VData', arr_len1 * sin(rep_angles), 'Visible','on');
+            set(h_rinfl1, 'XData', x1 + sapf.R_infl*cos(th_ri), ...
+                          'YData', y1 + sapf.R_infl*sin(th_ri), 'Visible','on');
+        else
+            set(h_rep1,   'Visible','off');
+            set(h_rinfl1, 'Visible','off');
+        end
+    else
+        set(h_rep1,   'Visible','off');
+        set(h_rinfl1, 'Visible','off');
+    end
+
+    % Obstacle 2
+    if seen2_log(k)
+        d_o2 = norm([x_log(k)-x2, y_log(k)-y2]);
+        d_s2 = max(d_o2 - obs_dyn2.rad, 1e-3);
+
+        if d_s2 < sapf.R_infl
+            mag2     = sapf.eta * (1/d_s2 - 1/sapf.R_infl) / (d_s2^2);
+            mag2     = max(0, mag2);
+            arr_len2 = min(mag2 * 0.8, sapf.R_infl * 0.55);
+
+            ox2 = x2 + obs_dyn2.rad * cos(rep_angles);
+            oy2 = y2 + obs_dyn2.rad * sin(rep_angles);
+
+            set(h_rep2, 'XData', ox2, 'YData', oy2, ...
+                        'UData', arr_len2 * cos(rep_angles), ...
+                        'VData', arr_len2 * sin(rep_angles), 'Visible','on');
+            set(h_rinfl2, 'XData', x2 + sapf.R_infl*cos(th_ri), ...
+                          'YData', y2 + sapf.R_infl*sin(th_ri), 'Visible','on');
+        else
+            set(h_rep2,   'Visible','off');
+            set(h_rinfl2, 'Visible','off');
+        end
+    else
+        set(h_rep2,   'Visible','off');
+        set(h_rinfl2, 'Visible','off');
+    end
 
     % Trail & obstacle statis tambahan
     if ~isempty(replan_idx) && k >= replan_idx
@@ -765,12 +902,12 @@ for k = 1:frame_step:length(t_log)
         set(h_trail_pre, 'XData', x_log(1:k), 'YData', y_log(1:k));
     end
 
-    % Info
+    % Info box
     det_str = '';
     if seen1_log(k), det_str = [det_str ' Dyn1']; end
     if seen2_log(k), det_str = [det_str ' Dyn2']; end
     if isempty(det_str), det_str = 'None'; end
-    set(hInfoBox, 'String', sprintf(' t=%.1fs | v=%.2f m/s | ψ=%.1f° | Det:%s', ...
+    set(hInfoBox, 'String', sprintf(' t=%.1fs | v=%.2f m/s | \\psi=%.1f\\circ | SAPF Det:%s', ...
         t_log(k), hypot(u_log(k), v_log(k)), rad2deg(psi_log(k)), det_str));
 
     target_t = t_log(k) / playback_speed;
@@ -790,7 +927,8 @@ if ~isempty(replan_idx)
 else
     set(h_trail_pre, 'XData',x_log, 'YData',y_log);
 end
-legend([h_trail_pre, h_trail_post],'Location','northwest','FontSize',8);
+legend([h_trail_pre, h_trail_post, h_rep1, h_rep2], ...
+    'Location','northwest','FontSize',8);
 
 %% --- Figure 3: Jarak ke Obstacle Dinamis ---
 figure('Name','Fig 3: Jarak ke Obstacle Dinamis','Position',[150 110 900 480]);
@@ -934,7 +1072,7 @@ function seen = camera_detect_static(pos, psi, obstacle, cam_static)
 end
 
 %% SAPF LOCAL PLANNER (untuk obstacle DINAMIS)
-function [psi_ref, v_ref] = sapf_local_planner(pos, psi, p_goal, obsDyn, v_ref_in, sapf)
+function [psi_ref, v_ref, F_rep_out] = sapf_local_planner(pos, psi, p_goal, obsDyn, v_ref_in, sapf)
     vec_g = p_goal - pos;
     d_g   = norm(vec_g) + 1e-9;
     F_att = sapf.zeta * (vec_g / d_g);
@@ -964,7 +1102,8 @@ function [psi_ref, v_ref] = sapf_local_planner(pos, psi, p_goal, obsDyn, v_ref_i
 
     F_tot = F_att + F_rep;
     if norm(F_tot) < 1e-6; F_tot = F_att; end
-    psi_ref = atan2(F_tot(2), F_tot(1));
+    psi_ref   = atan2(F_tot(2), F_tot(1));
+    F_rep_out = F_rep;   % kembalikan gaya repulsif untuk logging
 
     v_ref = v_ref_in;
     if obsDyn.active
