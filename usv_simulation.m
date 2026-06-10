@@ -164,11 +164,12 @@ T_max = 300;
 N_max = round(T_max / dt);
 
 %% ===== PLANNING PARAMS =====
-safe_dist_m = 1.5;
-safe_plan_m = 0.3;
-inflate_m   = safe_plan_m + safe_dist_m;
-n_per_seg   = 25;
-eps_rdp     = 1.0;
+safe_dist_m  = 1.5;
+safe_plan_m  = 0.3;
+inflate_m    = safe_plan_m + safe_dist_m;
+n_per_seg    = 25;
+eps_rdp      = 0.6;    % turun dari 1.0 → kurangi simplifikasi berlebihan
+los_step     = 0.5;    % resolusi pengecekan LOS shortcut [m]
 
 %% ===================================================================
 %% 1. BANGUN OCCUPANCY GRID
@@ -234,12 +235,20 @@ end
 fprintf('D* Lite: %d titik raw\n', size(path_global_m, 1));
 
 %% ===================================================================
-%% 3. G2-CBS C² PATH SMOOTHING + CLEARANCE ENFORCEMENT
+%% 3. LOS SHORTCUTTING + G2-CBS C² SMOOTHING + CLEARANCE ENFORCEMENT
 %% ===================================================================
 [~, idx_wp_raw] = min(vecnorm(path_global_m - waypoint_m, 2, 2));
 
 seg1_raw = path_global_m(1:idx_wp_raw, :);
 seg2_raw = path_global_m(idx_wp_raw:end, :);
+
+% LOS shortcutting per segmen — hapus zigzag D* Lite sebelum smoothing
+seg1_raw = shortcut_path(seg1_raw, obstacles_static_m, inflate_m, los_step);
+seg2_raw = shortcut_path(seg2_raw, obstacles_static_m, inflate_m, los_step);
+seg1_raw(1,:)   = start_m;    seg1_raw(end,:)   = waypoint_m;
+seg2_raw(1,:)   = waypoint_m; seg2_raw(end,:)   = goal_m;
+
+fprintf('Shortcut: seg1=%d titik, seg2=%d titik\n', size(seg1_raw,1), size(seg2_raw,1));
 
 seg1_smooth = smooth_path_g2cbs(seg1_raw, n_per_seg, eps_rdp);
 seg2_smooth = smooth_path_g2cbs(seg2_raw, n_per_seg, eps_rdp);
@@ -1173,7 +1182,7 @@ end
 
 %% D* LITE PATH PLANNING
 function path_g = dstar_lite_plan(occ, nR, nC, start_g, goal_g, w)
-    if nargin < 6, w = 1.52; end
+    if nargin < 6, w = 1.5; end
 
     sx = max(1, min(nC, round(start_g(1))));
     sy = max(1, min(nR, round(start_g(2))));
@@ -1307,6 +1316,44 @@ function [gx, gy] = nearest_free_cell(occ, gx0, gy0, nC, nR)
         end
     end
     gx = gx0; gy = gy0;
+end
+
+%% LOS SHORTCUTTING
+% Hapus titik perantara yang bisa dijangkau langsung tanpa menabrak obstacle.
+% Port dari PathSmoother.shortcut() Python.
+function P = shortcut_path(path_xy, obstacles_m, safe_dist_m, step)
+    P = path_xy;
+    if size(P,1) <= 2 || isempty(obstacles_m); return; end
+
+    result = P(1,:);
+    i = 1;
+    while i < size(P,1)
+        j = size(P,1);
+        while j > i+1
+            if los_clear(P(i,:), P(j,:), obstacles_m, safe_dist_m, step)
+                break;
+            end
+            j = j - 1;
+        end
+        result(end+1,:) = P(j,:); %#ok<AGROW>
+        i = j;
+    end
+    P = result;
+end
+
+function ok = los_clear(p1, p2, obstacles_m, safe_dist_m, step)
+    d = norm(p2 - p1);
+    if d < 1e-6; ok = true; return; end
+    n  = max(3, ceil(d / step));
+    ts = linspace(0, 1, n)';
+    pts = p1 + ts * (p2 - p1);   % (n x 2)
+    ok = true;
+    for ko = 1:size(obstacles_m,1)
+        dists = sqrt((pts(:,1)-obstacles_m(ko,1)).^2 + (pts(:,2)-obstacles_m(ko,2)).^2);
+        if any(dists < obstacles_m(ko,3) + safe_dist_m)
+            ok = false; return;
+        end
+    end
 end
 
 %% G2-CBS C² PATH SMOOTHING
